@@ -1,168 +1,167 @@
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
-import { startServer } from "./server";
+import type { Plugin } from "@opencode-ai/plugin"
 
-const plugin: Plugin = async (input, options) => {
-  const { client, project } = input;
-  const port = Number(options?.port) || 8788;
+const CLAUDE_WS_URL = "ws://127.0.0.1:8787/ws"
+const RECONNECT_INTERVAL = 5000
 
-  let activeSessionID: string | undefined;
-  const messageTexts = new Map<string, string>();
+/**
+ * OpenCode plugin that bridges to Claude Code's fakechat WebSocket server.
+ *
+ * When OpenCode starts, this plugin connects to ws://localhost:8787 (the Claude Code
+ * fakechat channel) and exposes a custom tool so the AI agent can delegate tasks
+ * to Claude Code programmatically.
+ *
+ * Usage in OpenCode session:
+ *   "Use the claude-code tool to refactor src/auth.ts"
+ */
+const plugin: Plugin = async ({ client, project, directory, worktree }) => {
+  let ws: WebSocket | null = null
+  let connected = false
+  let pendingRequests = new Map<string, {
+    resolve: (text: string) => void
+    reject: (err: Error) => void
+    timer: ReturnType<typeof setTimeout>
+  }>()
 
-  const server = startServer({
-    port,
-    async onPrompt(text, sessionID) {
-      try {
-        const targetSession = sessionID || activeSessionID;
-        if (!targetSession) {
-          // Create a new session if none active
-          server.broadcast({ type: "error", message: "No active session. Creating one..." });
-          const res = await client.session.create({ body: {} });
-          activeSessionID = res.data?.id;
-          server.broadcast({ type: "session_created", sessionID: activeSessionID });
+  let assistantBuffer = new Map<string, string>()
+  let currentMsgId: string | null = null
+
+  function connect() {
+    try {
+      ws = new WebSocket(CLAUDE_WS_URL)
+
+      ws.onopen = () => {
+        connected = true
+        client.app.log({
+          body: {
+            service: "opencode-claude-bridge",
+            level: "info",
+            message: "Connected to Claude Code fakechat at " + CLAUDE_WS_URL,
+          },
+        })
+      }
+
+      ws.onclose = () => {
+        connected = false
+        setTimeout(connect, RECONNECT_INTERVAL)
+      }
+
+      ws.onerror = () => {
+        connected = false
+      }
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data))
+
+          // Handle assistant responses
+          if (msg.type === "msg" && msg.from === "assistant") {
+            assistantBuffer.set(msg.id, msg.text || "")
+            currentMsgId = msg.id
+
+            // If there's a pending request, resolve it
+            // Claude Code sends complete responses in one message (non-streaming for us)
+            for (const [reqId, pending] of pendingRequests.entries()) {
+              clearTimeout(pending.timer)
+              pendingRequests.delete(reqId)
+              pending.resolve(msg.text || "")
+            }
+          }
+
+          // Handle edits (streaming updates)
+          if (msg.type === "edit" && currentMsgId) {
+            const existing = assistantBuffer.get(currentMsgId) || ""
+            assistantBuffer.set(currentMsgId, existing + (msg.text || ""))
+          }
+        } catch {
+          // Ignore parse errors
         }
-        const sid = sessionID || activeSessionID;
-        if (!sid) return;
-
-        await client.session.chat({
-          path: { id: sid },
-          body: { parts: [{ type: "text", text }] },
-        });
-      } catch (err) {
-        server.broadcast({ type: "error", message: String(err) });
       }
-    },
-    async onListSessions() {
-      try {
-        const res = await client.session.list();
-        const sessions = res.data ?? [];
-        return sessions.map((s: any) => ({
-          id: s.id,
-          title: s.title || s.id?.slice(0, 12),
-        }));
-      } catch {
-        return [];
-      }
-    },
-    onSwitchSession(sessionID) {
-      activeSessionID = sessionID;
-    },
-  });
+    } catch {
+      connected = false
+      setTimeout(connect, RECONNECT_INTERVAL)
+    }
+  }
 
-  await client.app.log({
-    body: {
-      service: "opencode-fakechat",
-      level: "info",
-      message: `Chat UI started on http://localhost:${port}`,
-    },
-  });
+  connect()
+
+  function sendToClaude(text: string, timeoutMs = 120000): Promise<string> {
+    return new Promise((resolve, reject) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        reject(new Error("Not connected to Claude Code fakechat"))
+        return
+      }
+
+      const id = `oc-bridge-${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const timer = setTimeout(() => {
+        pendingRequests.delete(id)
+        reject(new Error("Claude Code request timed out"))
+      }, timeoutMs)
+
+      pendingRequests.set(id, { resolve, reject, timer })
+      ws.send(JSON.stringify({ id, text }))
+    })
+  }
 
   return {
+    tool: {
+      "claude-code": {
+        description:
+          "Delegate a coding task to Claude Code via the fakechat WebSocket bridge. " +
+          "Use this for complex coding tasks like refactoring, implementing features, " +
+          "debugging, or any work that benefits from Claude Code's capabilities. " +
+          "Returns Claude Code's response as text.",
+        args: {
+          prompt: {
+            type: "string" as const,
+            description: "The task or prompt to send to Claude Code",
+          },
+          timeout: {
+            type: "number" as const,
+            description: "Timeout in seconds (default 120)",
+          },
+        },
+        async execute(args: { prompt: string; timeout?: number }) {
+          const timeoutMs = (args.timeout ?? 120) * 1000
+
+          if (!connected) {
+            return "⚠️ Not connected to Claude Code. Make sure Claude Code is running with --channels plugin:fakechat@claude-plugins-official"
+          }
+
+          try {
+            const response = await sendToClaude(args.prompt, timeoutMs)
+            return response || "(empty response from Claude Code)"
+          } catch (err: any) {
+            return `❌ Claude Code error: ${err.message}`
+          }
+        },
+      } satisfies any,
+
+      "claude-code-status": {
+        description: "Check the connection status to Claude Code fakechat bridge",
+        args: {},
+        async execute() {
+          const status = connected ? "✅ Connected" : "❌ Disconnected"
+          const url = CLAUDE_WS_URL
+          const pending = pendingRequests.size
+          return `${status} to ${url}\nPending requests: ${pending}\n\nTo start Claude Code:\nclaude --permission-mode bypassPermissions --channels plugin:fakechat@claude-plugins-official`
+        },
+      } satisfies any,
+    },
+
     event: async ({ event }) => {
-      const e = event as any;
-      const type = e.type as string;
-
-      switch (type) {
-        case "session.created": {
-          if (!activeSessionID) {
-            activeSessionID = e.properties?.id;
-          }
-          server.broadcast({
-            type: "session_created",
-            sessionID: e.properties?.id,
-          });
-          break;
-        }
-
-        case "session.idle": {
-          server.broadcast({
-            type: "session_status",
-            status: "idle",
-            sessionID: e.properties?.id,
-          });
-          server.broadcast({
-            type: "prompt_done",
-            sessionID: e.properties?.id,
-          });
-          break;
-        }
-
-        case "session.updated":
-        case "session.status": {
-          const status = e.properties?.status ?? "unknown";
-          server.broadcast({
-            type: "session_status",
-            status,
-            sessionID: e.properties?.id,
-          });
-          break;
-        }
-
-        case "message.part.updated": {
-          const props = e.properties ?? {};
-          const part = props.part;
-          if (part?.type === "text") {
-            const messageID = props.messageID ?? props.id ?? "unknown";
-            messageTexts.set(messageID, part.text ?? "");
-            server.broadcast({
-              type: "assistant_text",
-              messageID,
-              text: part.text ?? "",
-              streaming: true,
-            });
-          }
-          break;
-        }
-
-        case "message.updated": {
-          const props = e.properties ?? {};
-          const messageID = props.id ?? "unknown";
-          const text = messageTexts.get(messageID);
-          if (text !== undefined) {
-            server.broadcast({
-              type: "assistant_text",
-              messageID,
-              text,
-              streaming: false,
-            });
-            messageTexts.delete(messageID);
-          }
-          break;
-        }
-
-        case "session.error": {
-          server.broadcast({
-            type: "error",
-            message: e.properties?.error ?? "Session error",
-          });
-          break;
-        }
+      const e = event as any
+      // Log connection status changes
+      if (e.type === "session.created") {
+        await client.app.log({
+          body: {
+            service: "opencode-claude-bridge",
+            level: "info",
+            message: `Claude Code bridge status: ${connected ? "connected" : "disconnected"}`,
+          },
+        })
       }
     },
+  }
+}
 
-    "tool.execute.before": async ({ input: toolInput, output }) => {
-      const toolName = (toolInput as any)?.tool ?? "unknown";
-      server.broadcast({
-        type: "tool_start",
-        tool: toolName,
-        sessionID: activeSessionID,
-      });
-      return output;
-    },
-
-    "tool.execute.after": async ({ input: toolInput, output }) => {
-      const toolName = (toolInput as any)?.tool ?? "unknown";
-      server.broadcast({
-        type: "tool_end",
-        tool: toolName,
-        title: output?.title,
-        sessionID: activeSessionID,
-      });
-      return output;
-    },
-  };
-};
-
-export default {
-  id: "opencode-fakechat",
-  server: plugin,
-} satisfies PluginModule;
+export default plugin

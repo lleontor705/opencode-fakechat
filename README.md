@@ -1,84 +1,64 @@
-# opencode-fakechat
+# opencode-claude-bridge
 
-A WebSocket-based chat web UI plugin for [OpenCode](https://opencode.ai).
+OpenCode plugin that connects to Claude Code's fakechat WebSocket server, allowing OpenCode agents to delegate tasks to Claude Code.
 
-Provides a browser-accessible chat interface that bridges to OpenCode sessions, showing streaming responses, tool executions, and session management.
+## How it works
+
+```
+OpenCode AI Agent → claude-code tool → ws://localhost:8787 → Claude Code
+```
+
+When you run Claude Code with the fakechat channel:
+```bash
+claude --permission-mode bypassPermissions --channels plugin:fakechat@claude-plugins-official
+```
+
+It starts a WebSocket server on `ws://localhost:8787`. This plugin connects to it and exposes two custom tools in OpenCode:
+
+### Tools
+
+**`claude-code`** - Delegate a task to Claude Code
+- `prompt` (string, required): The task to send
+- `timeout` (number, optional): Timeout in seconds (default 120)
+
+**`claude-code-status`** - Check connection status
 
 ## Install
 
-Add to your project's `.opencode/package.json`:
+### Option 1: Local plugin
+Copy `src/index.ts` to your project's `.opencode/plugins/claude-bridge.ts`
 
+### Option 2: npm (when published)
+Add to your `opencode.json`:
 ```json
 {
-  "dependencies": {
-    "opencode-fakechat": "^0.1.0"
-  }
+  "plugin": ["opencode-claude-bridge"]
 }
 ```
 
-Then add to `opencode.json`:
+## Usage in OpenCode session
 
-```json
-{
-  "plugin": ["opencode-fakechat"]
-}
-```
+Once installed, tell the OpenCode agent:
+- "Use the claude-code tool to refactor the auth module"
+- "Delegate the bug fix in src/api.ts to Claude Code"
+- "Check if Claude Code is connected"
 
-With a custom port:
+## Requirements
 
-```json
-{
-  "plugin": [["opencode-fakechat", { "port": 9000 }]]
-}
-```
-
-## Usage
-
-Once OpenCode starts, open `http://localhost:8788` in your browser.
-
-The chat UI supports:
-
-- **Sending messages** — type in the input box and press Enter
-- **Streaming responses** — assistant replies stream in real-time
-- **Tool execution** — see when tools start and complete
-- **Session management** — list sessions in the sidebar, click to switch
-- **Auto-reconnect** — WebSocket reconnects automatically on disconnect
-
-## Configuration
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `port` | `8788` | HTTP/WebSocket server port |
+- [OpenCode](https://opencode.ai) installed
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) running with fakechat channel:
+  ```bash
+  claude --permission-mode bypassPermissions --channels plugin:fakechat@claude-plugins-official
+  ```
 
 ## Architecture
 
-```
-Browser ──WebSocket──▶ Bun.serve (src/server.ts)
-                            │
-                            ▼
-                     Plugin hooks (src/index.ts)
-                            │
-                            ▼
-                     OpenCode SDK client
-                      (session.chat, session.list)
-```
-
-- **src/index.ts** — Plugin entry point, exports hooks for OpenCode events
-- **src/server.ts** — Bun.serve HTTP + WebSocket server
-- **src/chat-ui.ts** — HTML/CSS/JS template for the chat interface
-
-## Events Handled
-
-| OpenCode Event | UI Effect |
-|---------------|-----------|
-| `session.created` | Notifies UI, updates session list |
-| `session.idle` | Status indicator turns green |
-| `session.updated` | Status indicator updates |
-| `message.part.updated` | Streams assistant text |
-| `message.updated` | Finalizes assistant message |
-| `tool.execute.before` | Shows tool start indicator |
-| `tool.execute.after` | Shows tool completion |
-| `session.error` | Displays error message |
+The plugin:
+1. Connects to `ws://localhost:8787/ws` on startup
+2. Auto-reconnects on disconnect (5s interval)
+3. Exposes `claude-code` custom tool that sends prompts via WebSocket
+4. Returns Claude Code's response to the OpenCode agent
+5. Handles timeouts and connection errors gracefully
 
 ## License
 
