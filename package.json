@@ -8,7 +8,8 @@
   },
   "main": "src/index.ts",
   "scripts": {
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "prepare": "husky"
   },
   "keywords": [
     "opencode",
@@ -22,5 +23,8 @@
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": "^1.0.0"
+  },
+  "devDependencies": {
+    "husky": "^9.1.7"
   }
 }

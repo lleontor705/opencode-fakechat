@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  quality:
+    uses: lleontor705/ats-deploy/.github/workflows/quality-node.yml@main
+    with:
+      node-version: "22"
+      package-manager: "bun"
+      lint-command: "bun run check"
+      enable-tests: false
+
+  security:
+    uses: lleontor705/ats-deploy/.github/workflows/security-scan.yml@main
