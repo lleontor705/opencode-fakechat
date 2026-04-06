@@ -1,4 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin"
+import { tool } from "@opencode-ai/plugin"
 
 const CLAUDE_WS_URL = "ws://127.0.0.1:8787/ws"
 const RECONNECT_INTERVAL = 5000
@@ -9,11 +10,8 @@ const RECONNECT_INTERVAL = 5000
  * When OpenCode starts, this plugin connects to ws://localhost:8787 (the Claude Code
  * fakechat channel) and exposes a custom tool so the AI agent can delegate tasks
  * to Claude Code programmatically.
- *
- * Usage in OpenCode session:
- *   "Use the claude-code tool to refactor src/auth.ts"
  */
-const plugin: Plugin = async ({ client, project, directory, worktree }) => {
+export default ((ctx) => {
   let ws: WebSocket | null = null
   let connected = false
   let pendingRequests = new Map<string, {
@@ -31,13 +29,6 @@ const plugin: Plugin = async ({ client, project, directory, worktree }) => {
 
       ws.onopen = () => {
         connected = true
-        client.app.log({
-          body: {
-            service: "opencode-claude-bridge",
-            level: "info",
-            message: "Connected to Claude Code fakechat at " + CLAUDE_WS_URL,
-          },
-        })
       }
 
       ws.onclose = () => {
@@ -53,13 +44,10 @@ const plugin: Plugin = async ({ client, project, directory, worktree }) => {
         try {
           const msg = JSON.parse(String(ev.data))
 
-          // Handle assistant responses
           if (msg.type === "msg" && msg.from === "assistant") {
             assistantBuffer.set(msg.id, msg.text || "")
             currentMsgId = msg.id
 
-            // If there's a pending request, resolve it
-            // Claude Code sends complete responses in one message (non-streaming for us)
             for (const [reqId, pending] of pendingRequests.entries()) {
               clearTimeout(pending.timer)
               pendingRequests.delete(reqId)
@@ -67,7 +55,6 @@ const plugin: Plugin = async ({ client, project, directory, worktree }) => {
             }
           }
 
-          // Handle edits (streaming updates)
           if (msg.type === "edit" && currentMsgId) {
             const existing = assistantBuffer.get(currentMsgId) || ""
             assistantBuffer.set(currentMsgId, existing + (msg.text || ""))
@@ -104,64 +91,40 @@ const plugin: Plugin = async ({ client, project, directory, worktree }) => {
 
   return {
     tool: {
-      "claude-code": {
+      "claude-code": tool({
         description:
           "Delegate a coding task to Claude Code via the fakechat WebSocket bridge. " +
           "Use this for complex coding tasks like refactoring, implementing features, " +
-          "debugging, or any work that benefits from Claude Code's capabilities. " +
-          "Returns Claude Code's response as text.",
+          "debugging, or any work that benefits from Claude Code's capabilities.",
         args: {
-          prompt: {
-            type: "string" as const,
-            description: "The task or prompt to send to Claude Code",
-          },
-          timeout: {
-            type: "number" as const,
-            description: "Timeout in seconds (default 120)",
-          },
+          prompt: tool.schema.string().describe("The task or prompt to send to Claude Code"),
+          timeout: tool.schema.number().optional().describe("Timeout in seconds (default 120)"),
         },
-        async execute(args: { prompt: string; timeout?: number }) {
-          const timeoutMs = (args.timeout ?? 120) * 1000
+        execute: async (args) => {
+          const timeoutMs = ((args.timeout as number) ?? 120) * 1000
 
           if (!connected) {
-            return "⚠️ Not connected to Claude Code. Make sure Claude Code is running with --channels plugin:fakechat@claude-plugins-official"
+            return "Not connected to Claude Code. Make sure Claude Code is running with --channels plugin:fakechat@claude-plugins-official"
           }
 
           try {
-            const response = await sendToClaude(args.prompt, timeoutMs)
+            const response = await sendToClaude(args.prompt as string, timeoutMs)
             return response || "(empty response from Claude Code)"
           } catch (err: any) {
-            return `❌ Claude Code error: ${err.message}`
+            return `Claude Code error: ${err.message}`
           }
         },
-      } satisfies any,
+      }),
 
-      "claude-code-status": {
+      "claude-code-status": tool({
         description: "Check the connection status to Claude Code fakechat bridge",
         args: {},
-        async execute() {
-          const status = connected ? "✅ Connected" : "❌ Disconnected"
-          const url = CLAUDE_WS_URL
+        execute: async () => {
+          const status = connected ? "Connected" : "Disconnected"
           const pending = pendingRequests.size
-          return `${status} to ${url}\nPending requests: ${pending}\n\nTo start Claude Code:\nclaude --permission-mode bypassPermissions --channels plugin:fakechat@claude-plugins-official`
+          return `${status} to ${CLAUDE_WS_URL}\nPending requests: ${pending}`
         },
-      } satisfies any,
-    },
-
-    event: async ({ event }) => {
-      const e = event as any
-      // Log connection status changes
-      if (e.type === "session.created") {
-        await client.app.log({
-          body: {
-            service: "opencode-claude-bridge",
-            level: "info",
-            message: `Claude Code bridge status: ${connected ? "connected" : "disconnected"}`,
-          },
-        })
-      }
+      }),
     },
   }
-}
-
-export default plugin
+}) satisfies Plugin
