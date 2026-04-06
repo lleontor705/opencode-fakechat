@@ -11,7 +11,7 @@ const RECONNECT_INTERVAL = 5000
  * fakechat channel) and exposes a custom tool so the AI agent can delegate tasks
  * to Claude Code programmatically.
  */
-export default ((ctx) => {
+export default (async (ctx) => {
   let ws: WebSocket | null = null
   let connected = false
   let pendingRequests = new Map<string, {
